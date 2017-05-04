@@ -6,27 +6,29 @@ package main
 // or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
 
 import (
+	"flag"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
 	log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/fsouza/go-dockerclient"
 	"github.com/aws/aws-sdk-go/service/cloudwatchevents"
-	"net/http"
-	"io/ioutil"
-	"strconv"
-	"strings"
-	"time"
-	"flag"
+	"github.com/aws/aws-sdk-go/service/route53"
+	docker "github.com/fsouza/go-dockerclient"
 )
 
 const workerTimeout = 180 * time.Second
 const defaultTTL = 0
 const defaultWeight = 1
 
-var DNSName = "servicediscovery.internal"
+// DNSName is the name of the DNS we're working with
+var DNSName = "example.ts"
 
 type handler interface {
 	Handle(*docker.APIEvents) error
@@ -118,7 +120,8 @@ func (th *dockerHandler) Handle(event *docker.APIEvents) error {
 type config struct {
 	HostedZoneId string
 	Hostname     string
-	Region		 string
+	Region       string
+	PrivateIP    string
 }
 
 var configuration config
@@ -169,7 +172,9 @@ func getDNSHostedZoneId() (string, error) {
 
 	if err == nil {
 		if len(zones.HostedZones) > 0 {
-			return aws.StringValue(zones.HostedZones[0].Id), nil
+			if aws.StringValue(zones.HostedZones[0].Name) == DNSName || aws.StringValue(zones.HostedZones[0].Name) == DNSName+"." {
+				return aws.StringValue(zones.HostedZones[0].Id), nil
+			}
 		}
 	}
 
@@ -306,20 +311,20 @@ func getNetworkPortAndServiceName(container *docker.Container, includePort bool)
 	return svc
 }
 
-func sendToCWEvents (detail string, detailType string, resource string, source string) error {
+func sendToCWEvents(detail string, detailType string, resource string, source string) error {
 	config := aws.NewConfig().WithRegion(configuration.Region)
 	sess := session.New(config)
 	svc := cloudwatchevents.New(sess)
 	params := &cloudwatchevents.PutEventsInput{
 		Entries: []*cloudwatchevents.PutEventsRequestEntry{
 			{
-				Detail: aws.String(detail),
+				Detail:     aws.String(detail),
 				DetailType: aws.String(detailType),
 				Resources: []*string{
 					aws.String(resource),
 				},
 				Source: aws.String(source),
-				Time: aws.Time(time.Now()),
+				Time:   aws.Time(time.Now()),
 			},
 		},
 	}
@@ -343,14 +348,174 @@ func getTaskArn(dockerID string) string {
 	return arnString[:arnEndIndex]
 }
 
+func getServiceInfo(container *docker.Container) ServiceInfo {
+	var svc ServiceInfo
+
+	for _, env := range container.Config.Env {
+		envEval := strings.Split(env, "=")
+
+		if len(envEval) == 2 && envEval[0] == "SERVICE_NAME" {
+			svc = ServiceInfo{envEval[1], ""}
+		}
+	}
+
+	return svc
+}
+
+func createDNSARecord(serviceName string, privateIP string) error {
+	r53 := route53.New(session.New())
+	recordName := serviceName + "." + DNSName
+
+	// list record sets
+	paramsList := &route53.ListResourceRecordSetsInput{
+		HostedZoneId:    aws.String(configuration.HostedZoneId), // Required
+		MaxItems:        aws.String("50"),
+		StartRecordName: aws.String(recordName),
+		StartRecordType: aws.String(route53.RRTypeA),
+	}
+
+	resp, err := r53.ListResourceRecordSets(paramsList)
+	logErrorNoFatal(err)
+	if err != nil {
+		return err
+	}
+
+	// we collect the resource records here
+	var resourceRecords []*route53.ResourceRecord
+
+	// find a matching record set for the given service name (with domain)
+	rrset := findMatchingDNSRecord(resp, recordName)
+
+	if rrset != nil {
+		// if not already among them
+		for _, rrec := range rrset.ResourceRecords {
+			// we don't want to lose the existing ones
+			resourceRecords = append(resourceRecords, rrec)
+			// we stop everything we're doing if the record with the same IP was found
+			if *rrec.Value == privateIP {
+				return nil
+			}
+		}
+	}
+
+	resourceRecords = append(resourceRecords, &route53.ResourceRecord{Value: aws.String(privateIP)})
+
+	fmt.Println("Final result of records", resourceRecords)
+
+	// prepare record for update
+	params := &route53.ChangeResourceRecordSetsInput{
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: []*route53.Change{
+				{
+					Action: aws.String(route53.ChangeActionUpsert),
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						Name:            aws.String(serviceName + "." + DNSName),
+						Type:            aws.String(route53.RRTypeA),
+						ResourceRecords: resourceRecords,
+						TTL:             aws.Int64(defaultTTL),
+					},
+				},
+			},
+		},
+		HostedZoneId: aws.String(configuration.HostedZoneId),
+	}
+
+	_, err = r53.ChangeResourceRecordSets(params)
+	logErrorNoFatal(err)
+	fmt.Println(err)
+	fmt.Println("Record " + serviceName + " updated with IP ( " + privateIP + ")")
+
+	return err
+}
+
+func deleteDNSARecord(serviceName string, privateIP string) error {
+	r53 := route53.New(session.New())
+	recordName := serviceName + "." + DNSName
+
+	// list record sets
+	paramsList := &route53.ListResourceRecordSetsInput{
+		HostedZoneId:    aws.String(configuration.HostedZoneId), // Required
+		MaxItems:        aws.String("50"),
+		StartRecordName: aws.String(recordName),
+		StartRecordType: aws.String(route53.RRTypeA),
+	}
+
+	resp, err := r53.ListResourceRecordSets(paramsList)
+	logErrorNoFatal(err)
+	if err != nil {
+		return err
+	}
+
+	// we collect the resource records here
+	var resourceRecords []*route53.ResourceRecord
+
+	// we also determine the action we need to take, in the case where we have only one
+	// ip for the record we delete the record completely, while when an ip remains
+	// we upsert
+	var action *string
+
+	// find a matching record set for the given service name (with domain)
+	rrset := findMatchingDNSRecord(resp, recordName)
+	if rrset != nil {
+		if len(rrset.ResourceRecords) == 1 && *rrset.ResourceRecords[0].Value == privateIP {
+			action = aws.String(route53.ChangeActionDelete)
+			resourceRecords = rrset.ResourceRecords
+		} else {
+			action = aws.String(route53.ChangeActionUpsert)
+			for _, rrec := range rrset.ResourceRecords {
+				// we only add those that don't match, that way when we upsert
+				// we make sure it's not among the IP list
+				if *rrec.Value != privateIP {
+					resourceRecords = append(resourceRecords, rrec)
+				}
+			}
+		}
+	}
+
+	// prepare record for update
+	params := &route53.ChangeResourceRecordSetsInput{
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: []*route53.Change{
+				{
+					Action: action,
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						Name:            aws.String(serviceName + "." + DNSName),
+						Type:            aws.String(route53.RRTypeA),
+						ResourceRecords: resourceRecords,
+						TTL:             aws.Int64(defaultTTL),
+					},
+				},
+			},
+		},
+		HostedZoneId: aws.String(configuration.HostedZoneId),
+	}
+
+	_, err = r53.ChangeResourceRecordSets(params)
+	logErrorNoFatal(err)
+
+	return err
+}
+
+func findMatchingDNSRecord(resp *route53.ListResourceRecordSetsOutput, recordName string) *route53.ResourceRecordSet {
+	if len(resp.ResourceRecordSets) > 0 {
+		for _, rrset := range resp.ResourceRecordSets {
+			fmt.Println(*rrset.Name, recordName)
+			if *rrset.Name == recordName || *rrset.Name == recordName+"." {
+				fmt.Println("Match for record name found..", *rrset.Name)
+				return rrset
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	var err error
 	var sum int
 	var zoneId string
 
 	var sendEvents = flag.Bool("cw-send-events", false, "Send CloudWatch events when a container is created or terminated")
-	
-	flag.Parse()
 
 	var DNSNameArg = flag.Arg(0)
 	if DNSNameArg != "" {
@@ -369,10 +534,14 @@ func main() {
 		time.Sleep(time.Duration(sum) * time.Second)
 		sum += 2
 	}
+	fmt.Println(zoneId)
 	configuration.HostedZoneId = zoneId
 	metadataClient := ec2metadata.New(session.New())
 	hostname, err := metadataClient.GetMetadata("/hostname")
 	configuration.Hostname = hostname
+	logErrorAndFail(err)
+	privateIP, err := metadataClient.GetMetadata("/local-ipv4")
+	configuration.PrivateIP = privateIP
 	logErrorAndFail(err)
 	region, err := metadataClient.Region()
 	configuration.Region = region
@@ -383,28 +552,17 @@ func main() {
 		var err error
 		container, err := dockerClient.InspectContainer(event.ID)
 		logErrorAndFail(err)
-		allService := getNetworkPortAndServiceName(container, true)
-		for _, svc := range allService {
-			if svc.Name != "" && svc.Port != "" {
-				sum = 1
-				for {
-					if err = createDNSRecord(svc.Name, event.ID, svc.Port); err == nil {
-						break
-					}
-					if sum > 8 {
-						log.Error("Error creating DNS record")
-						break
-					}
-					time.Sleep(time.Duration(sum) * time.Second)
-					sum += 2
-				}
-			}
-		}
+		serviceInfo := getServiceInfo(container)
+
+		createDNSARecord(serviceInfo.Name, privateIP)
+
 		if *sendEvents {
 			taskArn := getTaskArn(event.ID)
-			sendToCWEvents(`{ "dockerId": "` + event.ID + `","TaskArn":"` + taskArn + `" }`, "Task Started", configuration.Hostname, "awslabs.ecs.container" )
+			sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Started", configuration.Hostname, "awslabs.ecs.container")
 		}
+
 		fmt.Println("Docker " + event.ID + " started")
+
 		return nil
 	}
 
@@ -412,28 +570,17 @@ func main() {
 		var err error
 		container, err := dockerClient.InspectContainer(event.ID)
 		logErrorAndFail(err)
-		allService := getNetworkPortAndServiceName(container, false)
-		for _, svc := range allService {
-			if svc.Name != "" {
-				sum = 1
-				for {
-					if err = deleteDNSRecord(svc.Name, event.ID); err == nil {
-						break
-					}
-					if sum > 8 {
-						log.Error("Error deleting DNS record")
-						break
-					}
-					time.Sleep(time.Duration(sum) * time.Second)
-					sum += 2
-				}
-			}
-		}
+		serviceInfo := getServiceInfo(container)
+		deleteDNSARecord(serviceInfo.Name, privateIP)
+		fmt.Println(serviceInfo.Name)
+
 		if *sendEvents {
 			taskArn := getTaskArn(event.ID)
-			sendToCWEvents(`{ "dockerId": "` + event.ID + `","TaskArn":"` + taskArn + `" }`, "Task Stopped", configuration.Hostname, "awslabs.ecs.container" )
+			sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Stopped", configuration.Hostname, "awslabs.ecs.container")
 		}
+
 		fmt.Println("Docker " + event.ID + " stopped")
+
 		return nil
 	}
 
