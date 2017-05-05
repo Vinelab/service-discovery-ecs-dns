@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"os"
+
 	log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
@@ -28,7 +30,7 @@ const defaultTTL = 0
 const defaultWeight = 1
 
 // DNSName is the name of the DNS we're working with
-var DNSName = "example.ts"
+var DNSName string
 
 type handler interface {
 	Handle(*docker.APIEvents) error
@@ -517,10 +519,11 @@ func main() {
 
 	var sendEvents = flag.Bool("cw-send-events", false, "Send CloudWatch events when a container is created or terminated")
 
-	var DNSNameArg = flag.Arg(0)
-	if DNSNameArg != "" {
-		DNSName = DNSNameArg
+	if len(os.Args) < 2 {
+		panic("Must specify Domain as first argument")
 	}
+
+	DNSName = os.Args[1]
 
 	for {
 		// We try to get the Hosted Zone Id using exponential backoff
@@ -554,11 +557,13 @@ func main() {
 		logErrorAndFail(err)
 		serviceInfo := getServiceInfo(container)
 
-		createDNSARecord(serviceInfo.Name, privateIP)
+		if serviceInfo.Name != "" {
+			createDNSARecord(serviceInfo.Name, privateIP)
 
-		if *sendEvents {
-			taskArn := getTaskArn(event.ID)
-			sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Started", configuration.Hostname, "awslabs.ecs.container")
+			if *sendEvents {
+				taskArn := getTaskArn(event.ID)
+				sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Started", configuration.Hostname, "awslabs.ecs.container")
+			}
 		}
 
 		fmt.Println("Docker " + event.ID + " started")
@@ -571,12 +576,14 @@ func main() {
 		container, err := dockerClient.InspectContainer(event.ID)
 		logErrorAndFail(err)
 		serviceInfo := getServiceInfo(container)
-		deleteDNSARecord(serviceInfo.Name, privateIP)
-		fmt.Println(serviceInfo.Name)
 
-		if *sendEvents {
-			taskArn := getTaskArn(event.ID)
-			sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Stopped", configuration.Hostname, "awslabs.ecs.container")
+		if serviceInfo.Name != "" {
+			deleteDNSARecord(serviceInfo.Name, privateIP)
+
+			if *sendEvents {
+				taskArn := getTaskArn(event.ID)
+				sendToCWEvents(`{ "dockerId": "`+event.ID+`","TaskArn":"`+taskArn+`" }`, "Task Stopped", configuration.Hostname, "awslabs.ecs.container")
+			}
 		}
 
 		fmt.Println("Docker " + event.ID + " stopped")
